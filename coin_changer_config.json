@@ -1,0 +1,73 @@
+{
+  "pulse_map": {
+    "bill": {},
+    "coin": {}
+  },
+  "pulse_gap_seconds": 1.0,
+  "inhibit_verified": {
+    "bill": false,
+    "coin": false
+  },
+  "input_pin": {
+    "bill": 27,
+    "coin": 17
+  },
+  "inhibit_pin": {
+    "bill": 23,
+    "coin": 24
+  },
+  "inhibit_active_high": {
+    "bill": true,
+    "coin": true
+  },
+  "drop_sensor_pin": 22,
+  "sensor_debounce_seconds": 0.08,
+  "drop_timeout_seconds": 2.0,
+  "pca9685_address": "0x40",
+  "inventory_file": "inventory.json",
+  "journal_file": "transaction_state.json",
+  "servos": {
+    "0.25": {
+      "channel": 0,
+      "enabled": true,
+      "home_angle": 0,
+      "release_angle": 65,
+      "hold_seconds": 0.45
+    },
+    "1": {
+      "channel": 1,
+      "enabled": true,
+      "home_angle": 0,
+      "release_angle": 65,
+      "hold_seconds": 0.45
+    },
+    "5": {
+      "channel": 2,
+      "enabled": true,
+      "home_angle": 0,
+      "release_angle": 65,
+      "hold_seconds": 0.45
+    },
+    "10": {
+      "channel": 3,
+      "enabled": true,
+      "home_angle": 0,
+      "release_angle": 65,
+      "hold_seconds": 0.45
+    },
+    "20": {
+      "channel": 4,
+      "enabled": true,
+      "home_angle": 0,
+      "release_angle": 65,
+      "hold_seconds": 0.45
+    }
+  },
+  "servo_verified": {
+    "0.25": false,
+    "1": false,
+    "5": false,
+    "10": false,
+    "20": false
+  }
+}
