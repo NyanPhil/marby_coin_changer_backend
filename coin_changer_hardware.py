@@ -7,6 +7,7 @@ Never connect an acceptor's 12V signal directly to Raspberry Pi GPIO.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -60,10 +61,19 @@ class Storage:
 
     def receive(self, source, value):
         with self._lock:
+            allowed = {'bill': {50, 100}, 'coin': {1, 5, 10, 20}}
+            if (source not in allowed or type(value) is not int
+                    or value not in allowed[source]):
+                raise HardwareFault('Unsupported cash input.')
             if self.state.get('status') not in ('paid', None, 'completed', 'reconciled'):
                 raise HardwareFault('Another transaction requires operator review.')
             if self.state.get('status') == 'paid' and self.state.get('source') != source:
                 raise HardwareFault('Mixed input sources in a single transaction.')
+            if self.state.get('status') == 'paid' and source == 'bill':
+                raise HardwareFault('Only one bill is allowed per exchange. Operator required for additional cash.')
+            if (self.state.get('status') == 'paid'
+                    and self.state.get('credit', 0) + value > 100):
+                raise HardwareFault('The maximum exchange total is PHP 100.')
             if self.state.get('status') != 'paid':
                 self.state = {'status': 'paid', 'source': source, 'credit': 0,
                               'received': [], 'dispensed': {}, 'started_at': time.time()}
@@ -148,8 +158,19 @@ class Storage:
 
 
 class PulseCounter:
-    """Group falling edges into pulse frames; access from callbacks and UI."""
-    def __init__(self, min_edge_s=.018, gap_s=1.0, max_pulses=100):
+    """Count a frame, then require quiet after BOTH edges and an idle input.
+
+    An invalid/overlong frame is returned as ambiguous, never split or rounded.
+    require_release is enabled on real inputs; the default preserves callers
+    that feed only falling edges (including older diagnostic code).
+    """
+    def __init__(self, min_edge_s=.018, gap_s=1.0, max_pulses=100,
+                 require_release=False, max_frame_s=60.0):
+        if (not math.isfinite(gap_s) or gap_s <= 0
+                or not math.isfinite(min_edge_s) or min_edge_s < 0
+                or not math.isfinite(max_frame_s) or max_frame_s <= gap_s
+                or type(max_pulses) is not int or max_pulses < 1):
+            raise HardwareFault('Invalid pulse timing or frame limit.')
         self.lock = threading.Lock()
         self.min_edge_s = min_edge_s
         self.gap_s = gap_s
@@ -157,29 +178,77 @@ class PulseCounter:
         self.count = 0
         self.last = 0.0
         self.overflow = False
+        self.require_release = require_release
+        self.max_frame_s = max_frame_s
+        self.active = False
+        self.started = 0.0
+        self.last_pulse = 0.0
+
+    @property
+    def pending(self):
+        with self.lock:
+            return self.count > 0
+
+    def is_quiet(self, seconds):
+        with self.lock:
+            return (not self.count and not self.active
+                    and (self.last == 0 or time.monotonic() - self.last >= seconds))
 
     def edge(self):
         now = time.monotonic()
         with self.lock:
-            if self.count and now - self.last < self.min_edge_s:
+            if self.count and now - self.last_pulse < self.min_edge_s:
+                self.last = now
+                self.active = True
                 return False
             if self.count and now - self.last > self.gap_s:
                 # Missing UI poll means frame boundary was ambiguous.
                 self.overflow = True
             first_pulse = self.count == 0
+            if first_pulse:
+                self.started = now
             self.count += 1
             self.last = now
-            if self.count > self.max_pulses:
+            self.last_pulse = now
+            self.active = True
+            if self.count > self.max_pulses or now - self.started >= self.max_frame_s:
                 self.overflow = True
             return first_pulse
 
-    def drain(self):
+    def release(self):
         with self.lock:
-            if not self.count or time.monotonic() - self.last < self.gap_s:
+            self.active = False
+            self.last = time.monotonic()
+
+    def drain(self, idle=True):
+        with self.lock:
+            if not self.count:
                 return None
-            count, overflow = self.count, self.overflow
+            now = time.monotonic()
+            timed_out = now - self.started >= self.max_frame_s
+            if not timed_out and (now - self.last < self.gap_s
+                    or not idle or (self.require_release and self.active)):
+                return None
+            count, overflow = self.count, self.overflow or timed_out
             self.count, self.overflow = 0, False
             return count, overflow
+
+
+def pulse_counter_for(cfg, source):
+    """Build the per-source reader from the calibrated pulse profile.
+
+    The supplied profile uses three seconds for bills and two for coins.
+    A zero min-edge setting counts every falling edge, like the bench test;
+    only verified electrical signals should be used for cash recognition.
+    """
+    gap = cfg.get(source + '_pulse_gap_seconds',
+                  3.0 if source == 'bill' else cfg.get('pulse_gap_seconds', 1.0))
+    mapping = cfg.get('pulse_map', {}).get(source, {})
+    limit = max((int(k) for k in mapping), default=10) if source == 'bill' else 100
+    return PulseCounter(
+        min_edge_s=float(cfg.get(source + '_min_edge_seconds', .018)),
+        gap_s=float(gap), max_pulses=limit, require_release=True,
+        max_frame_s=float(cfg.get(source + '_max_frame_seconds', 45.0 if source == 'bill' else 60.0)))
 
 
 class RealHardware:
@@ -213,10 +282,17 @@ class RealHardware:
             raise HardwareFault('Unresolved transaction in transaction_state.json; operator must reconcile.')
         self.accepting = None
         self._accept_lock = threading.RLock()
+        self._requested_source = None
+        self._deposit_source = None
+        self._bill_latched = False
+        self._input_fault = None
         self.frame_permission = {'bill': None, 'coin': None}
         self.stopping = threading.Event()
-        self.pulses = {s: PulseCounter(gap_s=float(cfg.get('pulse_gap_seconds', 1.0)))
-                       for s in ('bill', 'coin')}
+        self.pulses = {s: pulse_counter_for(cfg, s) for s in ('bill', 'coin')}
+        self.rearm_quiet = {s: float(cfg.get(s + '_rearm_quiet_seconds', self.pulses[s].gap_s))
+                            for s in ('bill', 'coin')}
+        if any(not math.isfinite(v) or v < 0 for v in self.rearm_quiet.values()):
+            raise HardwareFault('Invalid acceptor rearm quiet period.')
         self.drop_count = 0
         self.drop_time = 0
         self.drop_lock = threading.Lock()
@@ -238,8 +314,9 @@ class RealHardware:
                     initial_value=False)
             for source in ('bill', 'coin'):
                 inp = DigitalInputDevice(cfg['input_pin'][source], pull_up=True)
-                inp.when_activated = self._make_pulse_callback(source)
                 self.inputs[source] = inp
+                inp.when_activated = self._make_pulse_callback(source)
+                inp.when_deactivated = self.pulses[source].release
             self.drop_sensor = DigitalInputDevice(cfg['drop_sensor_pin'], pull_up=True)
             self.drop_sensor.when_activated = self._on_drop
         except Exception:
@@ -248,19 +325,44 @@ class RealHardware:
 
     def _make_pulse_callback(self, source):
         def callback():
-            first = self.pulses[source].edge()
-            if first:
-                # One physical insertion is already underway: close intake
-                # immediately so a second bill/coin cannot arrive before
-                # the final pulse has been decoded by the UI.
-                with self._accept_lock:
+            # Acceptance checks and ownership of the first edge are atomic.
+            with self._accept_lock:
+                first = self.pulses[source].edge()
+                if first:
                     self.frame_permission[source] = (self.accepting == source)
+                    if source == 'bill':
+                        self._bill_latched = True
                     try:
                         self.set_acceptance(None)
                     except Exception:
                         self.frame_permission[source] = False
                         self.stopping.set()
         return callback
+
+    def input_pending(self, source=None):
+        sources = (source,) if source else ('bill', 'coin')
+        return any(self.pulses[s].pending for s in sources)
+
+    def begin_deposit(self, source):
+        """Explicitly open a new UI deposit session, never an in-flight bill."""
+        with self._accept_lock:
+            if source not in ('bill', 'coin'):
+                raise HardwareFault('Unsupported deposit source.')
+            if (self.stopping.is_set() or self.storage.unresolved
+                    or self.input_pending() or self._bill_latched):
+                raise HardwareFault('Finish or reconcile the current exchange before accepting another bill.')
+            self.set_acceptance(None)
+            self._deposit_source = source
+
+    def complete_transaction(self):
+        """Release the one-bill lock only after the payout is committed."""
+        with self._accept_lock:
+            self.set_acceptance(None)
+            if self.stopping.is_set() or self.input_pending():
+                raise HardwareFault('Cash signal arrived during payout. Operator must reconcile the cash.')
+            self.storage.complete()
+            self._bill_latched = False
+            self._deposit_source = None
 
     def _on_drop(self):
         now = time.monotonic()
@@ -271,30 +373,69 @@ class RealHardware:
 
     def set_acceptance(self, source=None):
         with self._accept_lock:
-            self.accepting = None
-            for output in self.inhibits.values():
-                output.off()
-            if source in ('bill', 'coin') and not self.stopping.is_set():
-                self.inhibits[source].on()
-                self.accepting = source
+            if source not in (None, 'bill', 'coin'):
+                raise HardwareFault('Unsupported acceptor.')
+            self._requested_source = source
+            self._refresh_acceptance()
+
+    def _refresh_acceptance(self):
+        # Caller holds _accept_lock. UI redraws cannot reopen an active frame,
+        # a bill already consumed by this session, or a paid bill transaction.
+        permitted = self._requested_source
+        if (permitted != self._deposit_source or self.stopping.is_set()
+                or self._input_fault or self.input_pending()
+                or any(inp.is_active for inp in self.inputs.values())
+                or any(not self.pulses[s].is_quiet(self.rearm_quiet[s])
+                       for s in ('bill', 'coin'))):
+            permitted = None
+        if permitted == 'bill' and (self._bill_latched or self.storage.unresolved):
+            permitted = None
+        if self.accepting == permitted and permitted is not None:
+            return
+        self.accepting = None
+        for output in self.inhibits.values():
+            output.off()
+        if permitted is not None:
+            self.inhibits[permitted].on()
+            self.accepting = permitted
+
+    def _latch_input_fault(self, detail):
+        self._input_fault = str(detail)
+        self.stopping.set()
+        self.set_acceptance(None)
+        # Persist ambiguity before returning a UI event. Existing credit remains
+        # recorded, but no additional value is inferred from the pulse total.
+        self.storage.fault(self._input_fault)
+        return [('fault', self._input_fault)]
 
     def poll(self):
         events = []
-        for source in ('bill', 'coin'):
-            frame = self.pulses[source].drain()
-            if frame is None:
-                continue
-            pulses, overflow = frame
-            with self._accept_lock:
+        with self._accept_lock:
+            if self._input_fault:
+                return []
+            for source in ('bill', 'coin'):
+                frame = self.pulses[source].drain(idle=not self.inputs[source].is_active)
+                if frame is None:
+                    continue
+                pulses, overflow = frame
                 allowed_at_first_pulse = self.frame_permission[source]
                 self.frame_permission[source] = None
-            value = self.maps[source].get(pulses)
-            if overflow or value is None:
-                events.append(('fault', f'Unknown {source} pulse train: {pulses} pulses. Operator required.'))
-            elif not allowed_at_first_pulse:
-                events.append(('fault', f'Unexpected {source} acceptance outside deposit mode: PHP {value}.'))
-            else:
+                value = self.maps[source].get(pulses)
+                if overflow or value is None:
+                    if source == 'bill':
+                        detail = (f'Ambiguous bill pulse group: {pulses} pulses. '
+                                  'Expected exactly 5 for PHP 50 or 10 for PHP 100. '
+                                  'Possible repeated bills or signal error; no credit inferred. '
+                                  'Operator must count and reconcile accepted cash.')
+                    else:
+                        detail = f'Unknown or ambiguous coin pulse train: {pulses} pulses. Operator required.'
+                    return self._latch_input_fault(detail)
+                if not allowed_at_first_pulse:
+                    return self._latch_input_fault(
+                        f'Unexpected {source} pulse group while intake was disabled: {pulses} pulses. '
+                        'Additional cash may have entered; operator must reconcile it.')
                 events.append((source, value))
+            self._refresh_acceptance()
         return events
 
     def dispense_one(self, coin):

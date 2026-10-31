@@ -1,9 +1,24 @@
 {
   "pulse_map": {
-    "bill": {},
-    "coin": {}
+    "bill": {
+      "5": 50,
+      "10": 100
+    },
+    "coin": {
+      "1": 1,
+      "5": 5,
+      "10": 10,
+      "20": 20
+    }
   },
-  "pulse_gap_seconds": 1.0,
+  "bill_pulse_gap_seconds": 3.0,
+  "coin_pulse_gap_seconds": 2.0,
+  "bill_min_edge_seconds": 0.0,
+  "coin_min_edge_seconds": 0.0,
+  "bill_rearm_quiet_seconds": 3.0,
+  "coin_rearm_quiet_seconds": 2.0,
+  "bill_max_frame_seconds": 45.0,
+  "coin_max_frame_seconds": 60.0,
   "inhibit_verified": {
     "bill": false,
     "coin": false

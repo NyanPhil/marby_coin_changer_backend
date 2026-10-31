@@ -2,6 +2,44 @@
 
 This package preserves the original 800×480 Tkinter UI and adds Raspberry Pi hardware control. **The code is not a substitute for physically verifying validator firmware, isolated wiring, coin delivery, and acceptor inhibition.**
 
+
+## Coin and bill input update on 31 October 2026
+
+The calibrated profile stores **coin pulses 1, 5, 10, 20 = PHP 1, 5, 10, 20**, and **bill pulses 5 = PHP 50 and 10 = PHP 100**. These are separate maps: 5 coin pulses credit PHP 5, while 5 bill pulses credit PHP 50. Bills use a **3-second quiet period after the last falling or rising transition**, with the input returned HIGH. Coins use their own 2-second quiet period, matching the latest standalone coin counter. A bill frame that lasts 45 seconds without completing is treated as ambiguous.
+
+The backend commands both acceptors disabled on the first pulse. A one-bill lock prevents screen redraws or repeated enable requests from reopening intake during counting or after bill credit. The lock is released only after the payout is committed; the customer must start another exchange. The deposit screen displays a processing message while the bill is being counted.
+
+**Fast repeat insertions:** a merged group of 15, 20, or 21 pulses produces a persistent service-required fault. The program does not round 21 to 20, split a merged group into assumed notes, or credit PHP 200. Existing recorded credit remains in the journal; an operator must inspect the physical cash and settle any additional amount. `marby_service.py` is used only after that reconciliation.
+
+**Physical prevention requires working INHIBIT.** The previously unwired inhibit circuit cannot be replaced by a longer timeout. Pulse counts alone do not uniquely identify note boundaries: 10 pulses can be one PHP 100 note or two PHP 50 notes. Verify that inhibition rejects the next bill while allowing all pulses for the current accepted bill to finish. If another note can be accepted before the first credit pulse, the pulse-only interface needs a verified busy/escrow signal or a different supported protocol before unattended use.
+
+### Apply this update to the existing project
+
+Stop the kiosk and back up your current Marby folder. Extract `Marby_Update.zip` into `~/Marby`, replacing the matching program/configuration files and adding `count_acceptor_pulses.py`. The archive contains the wiring guide and updated hardware backend, connected UI, configuration, calibration utility, tests and this guide. It does not contain inventory or transaction journals, so it cannot overwrite the physical coin counts or incident record.
+
+The supplied configuration now contains both pulse maps. Hardware-verification flags remain false until the actual inhibit and dispensing circuits pass their checks. Preserve or merge any additional measured settings from your actual machine; do not mark an unwired inhibit circuit as verified. In `inhibit_active_high`, true means the enable-driver command is driven HIGH when `.on()` is called. Match this to the verified external driver; it is not the TB74 DIP-switch polarity by itself.
+
+```bash
+cd ~/Marby
+.venv/bin/python -m unittest -v test_marby.py
+.venv/bin/python count_acceptor_pulses.py --source coin
+# Stop with Ctrl+C before running the other source.
+.venv/bin/python count_acceptor_pulses.py --source bill
+# To inspect decoded groups using the backend reader:
+.venv/bin/python calibrate_acceptors.py --source coin --diagnostic-only
+.venv/bin/python calibrate_acceptors.py --source bill --diagnostic-only
+```
+
+The read-only counters use GPIO17 for coins and GPIO27 for bills. They do not operate INHIBIT, credit money or run a servo. The simple counter reproduces the working falling-edge test; the calibration utility also reports the mapped denomination and ambiguous groups. Insert one bill and wait for the result before the next. It reports overlapping/over-limit groups as ambiguous. Normal calibration (`--source bill` without `--diagnostic-only`) requires verified inhibit control and disables intake during each frame.
+
+A working inhibit driver is reserved on **GPIO23 / physical pin 16** for TB74 control. That is a control-interface connection, not permission to attach the TB74's 12V inhibit wires directly to GPIO23. Pulse sensing remains on **GPIO27 / physical pin 13**. See `Marby_Acceptor_Wiring.docx` for both pulse circuits, the pull-up diagram and the conditional TB74 inhibit proposal. The Allan inhibit terminal is not established: GPIO24 remains reserved and unconnected. A spare HY-M158 channel is not automatically a 3.3V-compatible inhibit driver.
+
+### Pulse reader settings
+
+`bill_min_edge_seconds` and `coin_min_edge_seconds` are explicitly `0.0`, matching the successful standalone counter that counts every falling edge. No debounce or pulse ranges are introduced. Correct idle readings must remain at zero. The real backend also waits for an idle HIGH input and restarts the quiet timer after either edge. This is stricter framing than the simple counter, which times silence after falling edges only.
+
+The supplied tests use simulated GPIO and time; they do not verify electrical isolation, the physical inhibit polarity, coin delivery, or UI appearance on the Pi.
+
 ## 0. Hardware interpretation and limits
 
 - **UI host:** Raspberry Pi running Raspberry Pi OS Desktop. If the UI instead runs on a Windows PC with a separate ESP32 or Arduino, this wiring/backend will need a different transport.
@@ -16,8 +54,10 @@ This package preserves the original 800×480 Tkinter UI and adds Raspberry Pi ha
 - `coin_changer_connected.py`: your Tkinter interface, updated for hardware, five payout types, and simulation.
 - `coin_changer_hardware.py`: pulse counting, cash-acceptance inhibition, five servos, coin-exit confirmation, inventory, and transaction journal.
 - `coin_changer_config.json`: GPIO, pulse-to-denomination mappings and servo calibration.
-- `inventory.json`: **physical** coin counts; initially all zero. This must match what is loaded.
-- `calibrate_acceptors.py`: supervised pulse counter for one acceptor at a time.
+- `inventory.json`: **physical** coin counts; all zero in the original template. Preserve the actual loaded counts when applying this update.
+- `calibrate_acceptors.py`: supervised pulse decoder for one acceptor at a time.
+- `count_acceptor_pulses.py`: simple read-only falling-edge counter for either acceptor.
+- `Marby_Acceptor_Wiring.docx`: combined acceptor wiring, pull-up connections and inhibit status.
 - `marby_service.py`: audited reconciliation of interrupted transactions. **Does not refund or dispense coins.**
 - `run_marby.sh`: kiosk start command with log capture.
 - `test_marby.py`: local tests. 
@@ -33,8 +73,8 @@ The original `coin_changer_ui.py` remains untouched, so you can compare/restore 
 | Allan 1239 coin pulse input | GPIO17 | 11 | Verified 12V-to-3.3V isolated active-low pulse interface |
 | TB74 bill pulse input | GPIO27 | 13 | Verified isolated active-low pulse interface |
 | Coin-exit optical sensor | GPIO22 | 15 | 3.3V-compatible active-low, one pulse **per actual coin** |
-| TB74 enable/inhibit control | GPIO23 | 16 | Isolated/transistor switching circuit; verified fail-closed |
-| Allan enable/inhibit control | GPIO24 | 18 | Isolated/transistor switching circuit; verified fail-closed |
+| TB74 enable/inhibit control | GPIO23 | 16 | Conditional driver proposal in the wiring guide; verify before enabling |
+| Allan enable/inhibit control | GPIO24 | 18 | Reserved only; exact Allan inhibit input and driver remain to be established |
 | PCA9685 SDA | GPIO2 | 3 | PCA9685 SDA (3.3V logic) |
 | PCA9685 SCL | GPIO3 | 5 | PCA9685 SCL (3.3V logic) |
 | PCA9685 VCC | 3.3V | 1 | **Logic supply only**, not servo power |
@@ -59,14 +99,14 @@ Use one **sensor crossing per actually released coin**. Position the sensor so t
 
 ## 3. Prepare Raspberry Pi OS and install files
 
-Choose Raspberry Pi OS **Desktop**, set it to boot to the desktop, then copy or unzip the package into `~/marby`.
+Choose Raspberry Pi OS **Desktop**, set it to boot to the desktop, then copy or unzip the package into `~/Marby`.
 
 ```bash
 sudo apt update
 sudo apt install -y python3-tk python3-venv python3-pip python3-gpiozero python3-lgpio i2c-tools
-mkdir -p ~/marby
-unzip ~/Downloads/marby_hardware_bundle.zip -d ~/marby
-cd ~/marby
+mkdir -p ~/Marby
+unzip ~/Downloads/marby_hardware_bundle.zip -d ~/Marby
+cd ~/Marby
 python3 -m venv --system-site-packages .venv
 .venv/bin/pip install adafruit-circuitpython-servokit
 ```
@@ -82,7 +122,7 @@ For the default board address, look for `40` (hexadecimal). If absent, correct w
 ## 4. Start with a simulation (no acceptors / no servos needed)
 
 ```bash
-cd ~/marby
+cd ~/Marby
 .venv/bin/python -m unittest -v test_marby.py
 .venv/bin/python coin_changer_connected.py --windowed
 ```
@@ -97,16 +137,16 @@ In this mode, **tap the onscreen denomination pictures**; dispensing is simulate
 4. Run the pulse monitor for each source, one at a time:
 
 ```bash
-cd ~/marby
+cd ~/Marby
 .venv/bin/python calibrate_acceptors.py --source coin
 .venv/bin/python calibrate_acceptors.py --source bill
 ```
 
 5. Insert **one** known item and wait until its pulse count is printed before trying the next item. Repeat each denomination at least several times, including older/newer coin series if they are accepted. Record the observed stable **pulse-count → peso-value** mapping.
-6. Edit `coin_changer_config.json`, replacing the empty `pulse_map.bill` and `pulse_map.coin` objects with your **measured** data. Keys are pulse counts as strings, values are peso amounts as integers. For example, `{"2": 50}` means **two measured pulses represented ₱50 in your own test**; it is not a manufacturer-guaranteed example. Repeated/ambiguous pulse counts cannot be mapped to two values.
+6. The supplied maps are `pulse_map.bill = {"5": 50, "10": 100}` and `pulse_map.coin = {"1": 1, "5": 5, "10": 10, "20": 20}`. Recheck every denomination using the deployed wiring and then with inhibit active. Keys are pulse counts as strings, values are peso amounts as integers. For example, `{"2": 50}` means **two measured pulses represented ₱50 in your own test**; it is not a manufacturer-guaranteed example. Repeated/ambiguous pulse counts cannot be mapped to two values.
 7. Test that the acceptors refuse wrong denominations, coin doubles, oversized credit, and cash offered while in idle/review/dispensing. Only proceed when inhibition is physically reliable.
 
-There is a short intentional pause (~1 second after the last pulse) while the program decides a denomination. One item at a time, then wait for the credit display. To avoid merging two coin pulse groups, the code immediately inhibits the acceptor on the first pulse until the current pulse train has been decoded. **Verify this does not truncate the current pulse train on your particular validator.**
+There is an intentional quiet period after the last transition: 3 seconds for bills and 2 seconds for coins. LOW input prevents normal completion; an overlong frame faults. Bills accept exactly the configured 5/10 pulse mappings, with one bill per exchange. The backend inhibits intake on the first pulse and refuses re-enable requests during an unfinished frame or a consumed bill session. **Physically verify that inhibition rejects the next item without truncating the current pulse train.**
 
 ## 6. Calibrate the five servo gates
 
@@ -117,7 +157,7 @@ The `servos` object has **five entries** (`0.25`, `1`, `5`, `10`, `20`). Each en
 For a simple bench check of channel 1 (₱1), with acceptors OFF and **the tube empty**, run:
 
 ```bash
-cd ~/marby
+cd ~/Marby
 .venv/bin/python - <<'PY'
 from adafruit_servokit import ServoKit
 import time
@@ -148,14 +188,14 @@ The program rejects payout plans exceeding stock and conservatively disables acc
 After the wiring, inhibit behavior, pulse maps, five servos, common drop sensor, and inventory have all been verified:
 
 ```bash
-cd ~/marby
+cd ~/Marby
 .venv/bin/python coin_changer_connected.py --hardware --windowed
 ```
 
 If any required check is missing, startup is intentionally blocked. This is not an invitation to bypass the checks. For kiosk fullscreen, omit `--windowed`:
 
 ```bash
-cd ~/marby
+cd ~/Marby
 .venv/bin/python coin_changer_connected.py --hardware
 ```
 
@@ -185,7 +225,7 @@ cd ~/marby
 **Recovery procedure:** Lock access to the kiosk; read `transaction_state.json` to determine recorded credit, plan and sensor-confirmed coins. Count physical output and contents, reconcile with customer/operator, and update `inventory.json` based on actual remaining coins. Only after resolving the obligation use:
 
 ```bash
-cd ~/marby
+cd ~/Marby
 .venv/bin/python marby_service.py --operator "Technician ID" --reason "Physical cash counted; customer refund/settlement details"
 ```
 
@@ -201,16 +241,16 @@ cat > ~/.config/autostart/marby.desktop <<EOF
 [Desktop Entry]
 Type=Application
 Name=Marby Coin Changer
-Exec=$HOME/marby/run_marby.sh
+Exec=$HOME/Marby/run_marby.sh
 Terminal=false
 X-GNOME-Autostart-enabled=true
 EOF
 ```
 
-Restart and watch the screen. Logs are stored in `~/marby/marby.log`:
+Restart and watch the screen. Logs are stored in `~/Marby/marby.log`:
 
 ```bash
-tail -f ~/marby/marby.log
+tail -f ~/Marby/marby.log
 ```
 
 To temporarily disable auto-start while servicing, rename `~/.config/autostart/marby.desktop` to `marby.desktop.disabled`. Always verify the **hardware** acceptor-inhibit state when the kiosk is stopped; software shutdown alone is not sufficient to guarantee cash rejection.

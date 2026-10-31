@@ -6098,6 +6098,8 @@ class App:
         self.coin_future = None
         self.waiting_coin = None
         self.fault_message = ""
+        self.deposit_status_item = None
+        self.deposit_caption_item = None
         if self.hardware_mode:
             config = json.loads(project_path("coin_changer_config.json").read_text(encoding="utf8"))
             self.hardware = RealHardware(config)
@@ -6337,6 +6339,12 @@ class App:
             if mode == self.session.source:
                 self.show("deposit")
             return
+        if self.hardware:
+            try:
+                self.hardware.begin_deposit(mode)
+            except HardwareFault as error:
+                messagebox.showwarning("Please wait", str(error), parent=self.root)
+                return
         self.session.begin(mode)
         # A multi-coin validator cannot enforce the touchscreen's preferred coin.
         # Display all physically configured denominations instead.
@@ -6353,14 +6361,16 @@ class App:
         title = (f"Insert a {money(self.preferred_coin)} coin" if is_coin and self.preferred_coin
                  else "Insert coins" if is_coin else "Insert a bill")
         self.text(28, 135, title, 28, color=LIGHT)
-        self.text(28, 177, "Insert cash into the acceptor; wait for credit." if self.hardware
-                  else "Tap the picture to insert money.", 18, color=SOFT)
+        self.deposit_status_item = self.text(
+            28, 177, ("Insert one bill only. Wait for credit." if not is_coin
+                      else "Insert one coin, then wait for credit.") if self.hardware
+            else "Tap the picture to insert money.", 18, color=SOFT)
         self.text(570, 152, "Your credit", 18, color=SOFT)
         self.text(567, 184, money(self.amount), 44, True, TEXT)
         count = sum(self.session.inserted_coins.values())
         caption = (f"{count} coin{'s' if count != 1 else ''} inserted" if is_coin
                    else "Note accepted" if self.amount else "Waiting for a note")
-        self.text(570, 245, caption, 16, color=HEADER_MUTED)
+        self.deposit_caption_item = self.text(570, 245, caption, 16, color=HEADER_MUTED)
         if self.session.ready:
             hint = "Ready to choose\nyour coins."
             colour = LIGHT
@@ -6404,7 +6414,7 @@ class App:
             self.text(288, 276, returns[self.preferred_coin], 23, True, width=245)
         help_text = ("Insert one coin, then wait for the credit to update."
                      if self.hardware and is_coin else
-                     "Configured notes only: ₱50 and ₱100."
+                     "One bill per exchange. Finish before inserting another."
                      if self.hardware else
                      "₱5 and ₱10 coins can be changed to smaller coins."
                      if is_coin else "Accepted bills: ₱50 and ₱100.")
@@ -6740,7 +6750,7 @@ class App:
             return
         if self.hardware:
             try:
-                self.hardware.storage.complete()
+                self.hardware.complete_transaction()
             except HardwareFault as e:
                 self.hardware_fault(str(e))
                 return
@@ -6770,6 +6780,8 @@ class App:
     def go_home(self):
         if self.screen not in ("deposit", "admin"):
             return
+        if self.hardware and self.hardware.input_pending():
+            return  # Keep the processing screen until this cash signal resolves.
         if not self.amount:
             self.session.reset()
         self.show("idle")
@@ -6916,6 +6928,15 @@ class App:
                         self.insert_bill(value)
                     else:
                         self.insert_coin(value)
+                if (self.screen == "deposit" and self.session.source == "bill"
+                        and not self.fault_message and not self.amount):
+                    processing = self.hardware.input_pending("bill")
+                    text = ("Processing your bill. Do not insert another." if processing
+                            else "Insert one bill only. Wait for credit." if self.hardware.accepting == "bill"
+                            else "Please wait for the bill acceptor.")
+                    self.canvas.itemconfigure(self.deposit_status_item, text=text)
+                    self.canvas.itemconfigure(self.deposit_caption_item,
+                                              text="Please wait" if processing else "Waiting for a note")
                 if self.coin_future is not None and self.coin_future.done():
                     future = self.coin_future
                     coin = self.waiting_coin
